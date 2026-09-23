@@ -1,42 +1,40 @@
 /*
- * LED Face Mask - Audio Reactive (voice controlled)
- * ---------------------------------------------------
- * Board:   Seeed XIAO ESP32-S3
- * Mic:     INMP441 (I2S digital MEMS microphone)
+ * X Voice - Audio Reactive LED Face Mask (voice controlled)
+ * ---------------------------------------------------------
+ * Board:   Seeed XIAO nRF52840 Sense
+ * Mic:     onboard PDM MEMS microphone (no external wiring - built into
+ *          the Sense board itself)
  * LEDs:    WS2812B, 2.7mm ultra-narrow strip, 160 LEDs/m, ~1.5m -> 240 pixels
  *
  * Behavior:
- *  - Reads the mic continuously, computes a smoothed volume envelope (RMS -> dB).
+ *  - Reads the onboard mic continuously (PDM, mono, 16kHz), computes a
+ *    smoothed volume envelope (RMS -> dB).
  *  - Maps that envelope through a compressive curve so that normal speaking
  *    volume stays low, and only very loud volume approaches the intensity
  *    ceiling (MAX_LEVEL, default 0.80 = 80%).
  *  - Drives a slowly color-cycling effect whose BRIGHTNESS follows the voice
  *    envelope. Swap out `renderEffect()` for a different visual if desired.
- *  - A hardware-safety power budget (FastLED.setMaxPowerInVoltsAndMilliamps)
- *    is layered on top as a second, independent safety net.
  *
  * Library requirements (Arduino IDE Library Manager):
- *  - FastLED
- *  - Board package: esp32 by Espressif Systems.
- *    This sketch uses the legacy `driver/i2s.h` API, which is present and
- *    works on both the 2.x and 3.x Arduino-ESP32 core lines (on 3.x it is
- *    kept for backward compatibility). If your installed core ever drops it,
- *    switch to the newer `ESP_I2S.h` / I2SClass API instead - the RMS/curve
- *    logic below does not need to change.
+ *  - Adafruit NeoPixel
+ *    (FastLED's nRF52840 support is not solid yet - forum reports of
+ *    intermittent flicker on the "clockless_arm_nrf" driver on XIAO boards
+ *    specifically. Adafruit_NeoPixel is the library the community actually
+ *    uses successfully on this board, so that's what this sketch uses.)
+ *  - Board package: "Seeed nRF52 mbed-enabled Boards" in Boards Manager
+ *    (NOT the older non-mbed "Seeed nRF52 Boards" - the mbed-enabled one is
+ *    what ships PDM.h support for the onboard mic). Select
+ *    "Seeed XIAO nRF52840 Sense" as the board.
+ *  - PDM.h ships with that board package, nothing extra to install for the mic.
  *
- * Wiring (XIAO ESP32-S3 pin labels):
- *   LED strip DIN  -> D0   (GPIO1)   (+ 330-470ohm resistor in series, right
- *                                      at the strip's input pigtail)
- *   LED strip V+   -> Battery+ (direct, no boost converter - see README)
+ * Wiring (XIAO nRF52840 Sense pin labels):
+ *   LED strip DIN  -> D0        (+ 330-470ohm resistor in series, right at
+ *                                 the strip's input pigtail)
+ *   LED strip V+   -> Battery+  (direct, no boost converter - see README)
  *   LED strip GND  -> Battery- / GND (shared with board GND)
  *   Small cap (100-220uF) across V+/GND right at the strip's first pixel.
  *
- *   INMP441 VDD    -> 3V3
- *   INMP441 GND    -> GND
- *   INMP441 L/R    -> GND      (selects left channel)
- *   INMP441 WS     -> D1  (GPIO2)   (word select / LRCLK)
- *   INMP441 SD     -> D2  (GPIO3)   (data out from mic)
- *   INMP441 SCK    -> D3  (GPIO4)   (bit clock)
+ *   Microphone: nothing to wire - it's built into the Sense board.
  *
  * Calibration:
  *   Open Serial Monitor at 115200 baud. It prints the live dB reading.
@@ -46,37 +44,42 @@
  *      level with the default curve.
  *   3. Talk as loud/shout as you expect in real use -> set LOUD_DB to that
  *      value. That is the point that reaches MAX_LEVEL (80% by default).
+ *   MIC_GAIN below is a second knob (software gain on the PDM input itself,
+ *   0-80) - raise it if even shouting barely moves the dB reading, lower it
+ *   if the mic clips/flattens out on normal speech.
  */
 
-#include <FastLED.h>
-#include "driver/i2s.h"
+#include <PDM.h>
+#include <Adafruit_NeoPixel.h>
 
 // ---------------------------------------------------------------------------
 // LED CONFIG
 // ---------------------------------------------------------------------------
-#define LED_PIN         1     // D0
+#define LED_PIN         D0
 #define NUM_LEDS        240   // 1.5m * 160 LEDs/m
-#define COLOR_ORDER     GRB   // swap to RGB if colors look wrong on your strip
-#define LED_CHIPSET     WS2812B
 
-// Hard safety net independent of the software-level 80% cap below.
-// Tune to your battery's real max continuous discharge current (datasheet
-// C-rating x capacity), leaving headroom - e.g. a 400mAh/1C cell -> ~400mA
-// available for everything; a bigger cell you might swap to -> raise this.
-#define LED_SUPPLY_VOLTS      5
-#define MAX_LED_MILLIAMPS     700
+// Adafruit_NeoPixel has no automatic per-frame power limiter like FastLED.
+// Because renderEffect() below always sets every pixel to the SAME color and
+// brightness, total current is a direct, predictable function of MAX_LEVEL -
+// so that one constant (further down) is the power budget for this sketch.
+// If you change the effect to independently-colored pixels, add your own
+// current calculation here before raising MAX_LEVEL.
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // ---------------------------------------------------------------------------
-// MIC / I2S CONFIG
+// MIC / PDM CONFIG
 // ---------------------------------------------------------------------------
-#define I2S_WS_PIN      2     // D1 - word select (LRCLK)
-#define I2S_SD_PIN      3     // D2 - data in from mic
-#define I2S_SCK_PIN     4     // D3 - bit clock
-
-#define I2S_PORT        I2S_NUM_0
 #define SAMPLE_RATE     16000
-#define SAMPLE_BITS     32                 // INMP441 outputs 24-bit data left-justified in a 32-bit frame
-#define READ_BLOCK_SAMPLES  256            // samples per RMS window (~16ms @ 16kHz)
+#define MIC_GAIN        30     // 0-80, software gain on the PDM input
+
+short pdmBuffer[512];
+volatile int pdmSamplesRead = 0;
+
+void onPDMdata() {
+  int bytesAvailable = PDM.available();
+  PDM.read(pdmBuffer, bytesAvailable);
+  pdmSamplesRead = bytesAvailable / 2;   // 16-bit samples
+}
 
 // ---------------------------------------------------------------------------
 // VOICE -> BRIGHTNESS MAPPING
@@ -96,54 +99,25 @@ float LOUD_DB        = 85.0f;   // "shouting" - at/above this, level = 1.0 (pre-
 
 // ---------------------------------------------------------------------------
 
-CRGB leds[NUM_LEDS];
-int32_t i2sReadBuffer[READ_BLOCK_SAMPLES];
-
 float smoothedLevel = 0.0f;   // 0..MAX_LEVEL, drives the effect
-uint8_t hue = 0;
+uint16_t hue16 = 0;
 
-void setupI2S() {
-  i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = (i2s_bits_per_sample_t)SAMPLE_BITS,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
-    .dma_buf_len = READ_BLOCK_SAMPLES,
-    .use_apll = false,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk = 0
-  };
-
-  i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_SCK_PIN,
-    .ws_io_num = I2S_WS_PIN,
-    .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = I2S_SD_PIN
-  };
-
-  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_PORT, &pin_config);
-  i2s_zero_dma_buffer(I2S_PORT);
-}
-
-// Reads one block of samples and returns their RMS amplitude (0..~2^31).
+// Computes RMS over whatever PDM samples have arrived since the last call.
+// Returns -1 if no new samples are ready yet (caller should skip this tick).
 float readMicRMS() {
-  size_t bytesRead = 0;
-  i2s_read(I2S_PORT, (void*)i2sReadBuffer, sizeof(i2sReadBuffer), &bytesRead, portMAX_DELAY);
+  if (pdmSamplesRead <= 0) return -1.0f;
 
-  int samplesRead = bytesRead / sizeof(int32_t);
-  if (samplesRead <= 0) return 0.0f;
+  noInterrupts();
+  int count = pdmSamplesRead;
+  pdmSamplesRead = 0;
+  interrupts();
 
   double sumSquares = 0.0;
-  for (int i = 0; i < samplesRead; i++) {
-    // INMP441 24-bit sample is left-justified in the 32-bit word; shift down.
-    int32_t sample = i2sReadBuffer[i] >> 8;
-    sumSquares += (double)sample * (double)sample;
+  for (int i = 0; i < count; i++) {
+    double sample = pdmBuffer[i];
+    sumSquares += sample * sample;
   }
-  double meanSquare = sumSquares / samplesRead;
+  double meanSquare = sumSquares / count;
   return (float)sqrt(meanSquare);
 }
 
@@ -172,30 +146,35 @@ float smoothLevel(float target, float current) {
 // Replace this with any other effect - `smoothedLevel` (0..MAX_LEVEL) is
 // the only thing you need to read.
 void renderEffect() {
-  hue++;  // slow hue rotation over time regardless of volume
+  hue16 += 120;  // slow hue rotation over time regardless of volume
 
   uint8_t brightness = (uint8_t)(smoothedLevel * 255.0f);
-  CRGB color = CHSV(hue, 255, 255);
+  uint32_t color = strip.gamma32(strip.ColorHSV(hue16, 255, 255));
 
-  fill_solid(leds, NUM_LEDS, color);
-  FastLED.setBrightness(brightness);
-  FastLED.show();
+  strip.fill(color);
+  strip.setBrightness(brightness);
+  strip.show();
 }
 
 void setup() {
   Serial.begin(115200);
 
-  setupI2S();
+  strip.begin();
+  strip.setBrightness(0);
+  strip.show();
 
-  FastLED.addLeds<LED_CHIPSET, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
-  FastLED.setMaxPowerInVoltsAndMilliamps(LED_SUPPLY_VOLTS, MAX_LED_MILLIAMPS);
-  FastLED.setBrightness(0);
-  FastLED.clear();
-  FastLED.show();
+  PDM.onReceive(onPDMdata);
+  PDM.setGain(MIC_GAIN);
+  if (!PDM.begin(1, SAMPLE_RATE)) {   // mono, 16kHz
+    Serial.println("PDM init failed - check board package (needs the mbed-enabled Seeed nRF52 core)");
+    while (1) { delay(1000); }
+  }
 }
 
 void loop() {
   float rms = readMicRMS();
+  if (rms < 0.0f) return;   // no new samples yet this tick
+
   float targetLevel = rmsToLevel(rms);
   smoothedLevel = smoothLevel(targetLevel, smoothedLevel);
 
