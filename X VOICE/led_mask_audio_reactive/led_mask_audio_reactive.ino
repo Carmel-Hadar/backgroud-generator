@@ -12,12 +12,17 @@
  *  - Maps that envelope through a compressive curve so that normal speaking
  *    volume stays low, and only very loud volume approaches the intensity
  *    ceiling (MAX_LEVEL, default 0.80 = 80%).
- *  - Drives a slowly color-cycling effect whose BRIGHTNESS follows the voice
- *    envelope. Swap out `renderEffect()` for a different visual if desired.
+ *  - Effect: all LEDs light up in a single fixed color (LED_R/LED_G/LED_B),
+ *    with BRIGHTNESS following the voice envelope - louder = brighter, one
+ *    strip-wide reaction. Swap out `renderEffect()` for a different visual.
  *  - A second, independent ceiling (MAX_LED_MILLIAMPS) caps brightness further
  *    if needed to keep estimated LED current under a hard mA budget - see
  *    powerLimitedBrightness(). MAX_LEVEL and MAX_LED_MILLIAMPS both apply;
  *    whichever is more restrictive at any given moment wins.
+ *  - DEBUG_PLOT_AUDIO (on by default): while USB-connected, prints the raw
+ *    mic level and the mapped brightness level every mic read, in a format
+ *    the Arduino IDE's Serial Plotter (Tools -> Serial Plotter, 115200 baud)
+ *    graphs live - useful for watching the mic react and for calibration.
  *
  * Library requirements (Arduino IDE Library Manager):
  *  - Adafruit NeoPixel
@@ -41,13 +46,16 @@
  *   Microphone: nothing to wire - it's built into the Sense board.
  *
  * Calibration:
- *   Open Serial Monitor at 115200 baud. It prints the live dB reading.
- *   1. Stay silent, note the "quiet" dB value -> set NOISE_FLOOR_DB a couple
+ *   Open the Serial Plotter (Tools -> Serial Plotter) at 115200 baud - with
+ *   DEBUG_PLOT_AUDIO on (default) it graphs two lines live: the raw mic dB
+ *   reading, and the mapped brightness level (x100, so both sit in a
+ *   comparable range on the same graph).
+ *   1. Stay silent, read the "quiet" dB line -> set NOISE_FLOOR_DB a couple
  *      dB above it (so background hiss doesn't light up the mask).
- *   2. Talk normally, note the dB value -> this should map to a low/medium
- *      level with the default curve.
+ *   2. Talk normally -> this should map to a low/medium level with the
+ *      default curve.
  *   3. Talk as loud/shout as you expect in real use -> set LOUD_DB to that
- *      value. That is the point that reaches MAX_LEVEL (80% by default).
+ *      dB value. That is the point that reaches MAX_LEVEL (80% by default).
  *   MIC_GAIN below is a second knob (software gain on the PDM input itself,
  *   0-80) - raise it if even shouting barely moves the dB reading, lower it
  *   if the mic clips/flattens out on normal speech.
@@ -61,6 +69,12 @@
 // ---------------------------------------------------------------------------
 #define LED_PIN         D0
 #define NUM_LEDS        240   // 1.5m * 160 LEDs/m
+
+// Fixed color for the whole strip - only brightness changes with volume.
+// Edit these to change the mask's color; 255,255,255 = white.
+#define LED_R  255
+#define LED_G  255
+#define LED_B  255
 
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -135,9 +149,19 @@ float LOUD_DB        = 85.0f;   // "shouting" - at/above this, level = 1.0 (pre-
 #define DECAY_ALPHA      0.12f
 
 // ---------------------------------------------------------------------------
+// SERIAL PLOTTER (for tuning while the board is plugged into a computer)
+// ---------------------------------------------------------------------------
+// 1 = print [dB, mapped level x100] every mic read, for Arduino IDE's
+// Serial Plotter (Tools -> Serial Plotter, 115200 baud) to graph live.
+// Safe to leave on: guarded by `if (Serial)`, so it costs nothing when the
+// mask is running standalone with no computer attached. Set to 0 to disable
+// entirely once you're done tuning.
+#define DEBUG_PLOT_AUDIO   1
+
+// ---------------------------------------------------------------------------
 
 float smoothedLevel = 0.0f;   // 0..MAX_LEVEL, drives the effect
-uint16_t hue16 = 0;
+float lastDb = 0.0f;          // last raw dB reading, exposed for the plotter
 
 // Computes RMS over whatever PDM samples have arrived since the last call.
 // Returns -1 if no new samples are ready yet (caller should skip this tick).
@@ -162,9 +186,7 @@ float readMicRMS() {
 // then applies the compressive curve.
 float rmsToLevel(float rms) {
   float db = (rms > 1.0f) ? 20.0f * log10f(rms) : 0.0f;
-
-  // Uncomment while calibrating:
-  // Serial.println(db);
+  lastDb = db;   // stashed for the Serial Plotter output in loop()
 
   float normalized = (db - NOISE_FLOOR_DB) / (LOUD_DB - NOISE_FLOOR_DB);
   normalized = constrain(normalized, 0.0f, 1.0f);
@@ -179,14 +201,13 @@ float smoothLevel(float target, float current) {
   return current + alpha * (target - current);
 }
 
-// Default visual: slow color cycle, brightness follows the voice envelope.
-// Replace this with any other effect - `smoothedLevel` (0..MAX_LEVEL) is
-// the only thing you need to read.
+// Simplest possible effect: the whole strip is one fixed color
+// (LED_R/LED_G/LED_B), and brightness alone follows the voice envelope -
+// louder = brighter. Replace this with any other effect - `smoothedLevel`
+// (0..MAX_LEVEL) is the only thing you need to read.
 void renderEffect() {
-  hue16 += 120;  // slow hue rotation over time regardless of volume
-
   uint8_t desiredBrightness = (uint8_t)(smoothedLevel * 255.0f);
-  uint32_t color = strip.gamma32(strip.ColorHSV(hue16, 255, 255));  // full-scale color
+  uint32_t color = strip.Color(LED_R, LED_G, LED_B);  // full-scale color
   uint8_t brightness = powerLimitedBrightness(color, desiredBrightness);
 
   // NeoPixel applies brightness scaling when a pixel color is SET, not at
@@ -218,6 +239,14 @@ void loop() {
 
   float targetLevel = rmsToLevel(rms);
   smoothedLevel = smoothLevel(targetLevel, smoothedLevel);
+
+#if DEBUG_PLOT_AUDIO
+  if (Serial) {
+    Serial.print(lastDb);
+    Serial.print(",");
+    Serial.println(smoothedLevel * 100.0f);
+  }
+#endif
 
   renderEffect();
 }
