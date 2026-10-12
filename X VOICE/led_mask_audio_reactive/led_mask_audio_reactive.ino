@@ -14,7 +14,7 @@
  *    volume stays low, and only very loud volume approaches the intensity
  *    ceiling (MAX_LEVEL, default 0.50 = 50% perceived).
  *  - Effect: a single fixed color (LED_R/LED_G/LED_B) glowing from the X's
- *    center (STRIP1_CENTER/STRIP2_CENTER) with a Gaussian falloff along the strips -
+ *    center (strip1Center/strip2Center) with a Gaussian falloff along the strips -
  *    louder = brighter center AND a wider spread down the arms.
  *    Swap out `renderEffect()` for a different visual.
  *  - A second, independent ceiling (MAX_LED_MILLIAMPS) caps brightness further
@@ -81,7 +81,9 @@
 // ---------------------------------------------------------------------------
 // LED CONFIG
 // ---------------------------------------------------------------------------
-#define LED_PIN         D4
+// Strip 1 / strip 2 = the strips as mapped with led_finder.py (59 LEDs
+// center 29 / 61 LEDs center 31). Strip 1 is the one wired to D10 + D7.
+#define LED_PIN         D10
 
 // Strip power switch: an AO3400A (N-channel, logic level) on the strip's
 // GROUND side - gate on STRIP_PWR_PIN. No gate pull-down fitted: the gate
@@ -89,11 +91,11 @@
 // in sleep the pin actively holds it LOW. Each WS2812 draws ~0.3-1mA even when dark, x240 =
 // 70-240mA, so without this a "sleeping" mask still drained a 400mAh cell in
 // ~1.5-5 hours. In sleep the strip is cut off completely.
-#define STRIP_PWR_PIN   D5      // D5 is free: the IMU is on the internal Wire1 bus, not D4/D5
+#define STRIP_PWR_PIN   D7
 
 // Second strip, same wiring (own AO3400A on its ground).
-#define LED2_PIN        D10
-#define STRIP2_PWR_PIN  D7
+#define LED2_PIN        D4
+#define STRIP2_PWR_PIN  D5      // D5 is free: the IMU is on the internal Wire1 bus, not D4/D5
 
 // The X is two strips, one per diagonal, crossing at the center. Every
 // effect works on one virtual strip: strip 1's pixels, then strip 2's
@@ -1015,11 +1017,19 @@ float smoothLevel(float target, float current) {
 // ---------------------------------------------------------------------------
 // The X's center: this LED on each strip. Both sit at the same physical
 // spot. Light starts there and spreads outward along both strips with a
-// Gaussian falloff. As virtual pixels: X_CENTER_A and X_CENTER_B.
-#define STRIP1_CENTER  29
-#define STRIP2_CENTER  31
-#define X_CENTER_A     STRIP1_CENTER
-#define X_CENTER_B     (NUM_LEDS1 + STRIP2_CENTER)
+// Gaussian falloff.
+// Strip-local LED positions; may be x.5 when the crossing point falls
+// between two LEDs. Tuned live with center_tuner.py ('K' command).
+#define STRIP1_CENTER  29.0f
+#define STRIP2_CENTER  31.0f
+float strip1Center = STRIP1_CENTER;
+float strip2Center = STRIP2_CENTER;
+
+// Signed distance (in LEDs, along its own strip) from a virtual pixel to the
+// X's center: negative = toward the strip's LED 0, positive = toward its end.
+inline float centerOffset(int i) {
+  return (i < NUM_LEDS1) ? (float)i - strip1Center : (float)(i - NUM_LEDS1) - strip2Center;
+}
 
 // Gaussian width (sigma, in pixels) grows with volume: quiet speech lights
 // only a small glow at the center, loud speech spreads down all four arms.
@@ -1037,7 +1047,7 @@ float smoothLevel(float target, float current) {
 // pixel to PWM duty (duty = perceived^gamma) so the falloff reads as a falloff.
 #define LED_GAMMA    2.2f
 
-uint8_t distToCenter[NUM_LEDS];   // strip-distance from each pixel to the X center
+float distToCenter[NUM_LEDS];     // |centerOffset()|, cached
 
 // ---------------------------------------------------------------------------
 // MODES (cycled by the double tongue-click trigger)
@@ -1186,7 +1196,7 @@ void renderParty() {
   partyGrain += PARTY_SMOOTH * (grainTarget - partyGrain);
 
   for (int i = 0; i < NUM_LEDS; i++) {
-    float u = (i < NUM_LEDS1) ? (float)(i - X_CENTER_A) : (float)(i - X_CENTER_B);
+    float u = centerOffset(i);
     float h = partyHue + u / PARTY_RAINBOW_LEDS;
     h -= floorf(h);
     // two octaves for a less "regular" texture
@@ -1299,10 +1309,13 @@ void renderRace() {
 #define CONV_HUE_ORANGE   4500     // ColorHSV hue units: red = 0 / 65536
 #define CONV_HUE_PURPLE   (-15500) // below red: 65536 - 15500 = purple
 
-struct ConvArm { int start; int dir; int len; };
-ConvArm convArms[4];
-int     convRefLen = 1;             // shortest arm - comet positions are in its units (sync mode)
-int     convMaxLen = 1;             // longest arm - comets live until they've crossed it
+// The four arms = the two sides of each strip's center. Everything is in
+// distance-from-center, so a center between two LEDs (x.5) and arms of
+// different lengths just work: a comet's head starts armLen out and moves to 0.
+// armLen = min(CONV_START_DIST, distance from the center to that strip end).
+float convArmLen[4];               // [strip*2 + side], side 0 = toward LED 0, 1 = toward the end
+float convRefLen = 1.0f;           // shortest arm - comet positions are in its units (sync mode)
+float convMaxLen = 1.0f;           // longest arm
 
 #define CONV_MAX_COMETS 24
 struct Comet { float pos; uint16_t hue; };
@@ -1310,30 +1323,28 @@ Comet    comets[CONV_MAX_COMETS];
 int      cometCount     = 0;
 float    convSinceLaunch = CONV_SPACING;   // launch immediately when talking starts
 uint32_t convLastMs     = 0;
+bool     convDemo       = false;   // 'W': launch comets without talking, for tuning the center
+#define  CONV_DEMO_LPS    40.0f
 
-bool convInPath[NUM_LEDS];         // pixel belongs to a comet path (else: voice glow)
+inline int convArmOf(int i) {
+  return ((i < NUM_LEDS1) ? 0 : 2) + (centerOffset(i) < 0.0f ? 0 : 1);
+}
 
 void initConvergeArms() {
-  convArms[0] = {0,             +1, X_CENTER_A};                    // strip 1: LED 0 -> center
-  convArms[1] = {NUM_LEDS1 - 1, -1, NUM_LEDS1 - 1 - X_CENTER_A};    // strip 1: last LED -> center
-  convArms[2] = {NUM_LEDS1,     +1, X_CENTER_B - NUM_LEDS1};        // strip 2: LED 0 -> center
-  convArms[3] = {NUM_LEDS - 1,  -1, NUM_LEDS - 1 - X_CENTER_B};     // strip 2: last LED -> center
-  // Comets only fly the last CONV_START_DIST LEDs of each arm: move each
-  // arm's start in toward the center (the center end stays put).
+  float len[4] = {strip1Center, (NUM_LEDS1 - 1) - strip1Center,
+                  strip2Center, (NUM_LEDS2 - 1) - strip2Center};
+  convRefLen = 1e9f; convMaxLen = 0.0f;
   for (int a = 0; a < 4; a++) {
-    ConvArm& arm = convArms[a];
-    int center = arm.start + arm.dir * arm.len;
-    if (arm.len > CONV_START_DIST) arm.len = CONV_START_DIST;
-    arm.start = center - arm.dir * arm.len;
+    convArmLen[a] = fminf(len[a], (float)CONV_START_DIST);
+    convRefLen = fminf(convRefLen, convArmLen[a]);
+    convMaxLen = fmaxf(convMaxLen, convArmLen[a]);
   }
-  for (int i = 0; i < NUM_LEDS; i++) convInPath[i] = false;
-  for (int a = 0; a < 4; a++)
-    for (int x = 0; x <= convArms[a].len; x++) convInPath[convArms[a].start + convArms[a].dir * x] = true;
-  convRefLen = convMaxLen = convArms[0].len;
-  for (int a = 1; a < 4; a++) {
-    if (convArms[a].len < convRefLen) convRefLen = convArms[a].len;
-    if (convArms[a].len > convMaxLen) convMaxLen = convArms[a].len;
-  }
+}
+
+// Distances / arms depend on the centers: recompute whenever they change.
+void recomputeLayout() {
+  for (int i = 0; i < NUM_LEDS; i++) distToCenter[i] = fabsf(centerOffset(i));
+  initConvergeArms();
 }
 
 // Pitch -> hue: continuous orange <- red -> purple gradient in log-frequency.
@@ -1354,51 +1365,47 @@ void renderConverge() {
   uint32_t now = millis();
   float dt = convLastMs ? (now - convLastMs) / 1000.0f : 0.0f;
   convLastMs = now;
-  float speed = CONV_MIN_LPS * powf(CONV_MAX_LPS / CONV_MIN_LPS, powf(smoothedVolume, RACE_CURVE));
+  float speed = convDemo ? CONV_DEMO_LPS
+                         : CONV_MIN_LPS * powf(CONV_MAX_LPS / CONV_MIN_LPS, powf(smoothedVolume, RACE_CURVE));
   float step = speed * dt;
 
   // move, and drop comets whose tail has fully entered the center
+  float life = (CONV_SYNC_ARRIVAL ? convRefLen : convMaxLen) + 4.0f * CONV_TAIL_SIGMA;
   int keep = 0;
   for (int c = 0; c < cometCount; c++) {
     comets[c].pos += step;
-    float life = (CONV_SYNC_ARRIVAL ? convRefLen : convMaxLen) + 4.0f * CONV_TAIL_SIGMA;
     if (comets[c].pos < life) comets[keep++] = comets[c];
   }
   cometCount = keep;
 
   // launch a new wave every CONV_SPACING LEDs of travel while talking
   convSinceLaunch += step;
-  if (smoothedVolume > CONV_TALK_VOLUME && convSinceLaunch >= CONV_SPACING && cometCount < CONV_MAX_COMETS) {
+  bool talking = convDemo || smoothedVolume > CONV_TALK_VOLUME;
+  if (talking && convSinceLaunch >= CONV_SPACING && cometCount < CONV_MAX_COMETS) {
     comets[cometCount++] = {0.0f, convergeHue()};
     convSinceLaunch = 0.0f;
   }
 
-  // outside the comet paths: a glow that follows the voice
+  // beyond the comet paths: a glow that follows the voice
   uint32_t glowColor = strip.ColorHSV(convergeHue(), 255, 255);
   float glowDuty = powf(CONV_BG_LEVEL * smoothedVolume, LED_GAMMA);
-  for (int i = 0; i < NUM_LEDS; i++) {
-    pixDuty[i]  = convInPath[i] ? 0.0f : glowDuty;
-    pixColor[i] = glowColor;
-  }
   const float inv2s2 = 1.0f / (2.0f * CONV_TAIL_SIGMA * CONV_TAIL_SIGMA);
-  for (int c = 0; c < cometCount; c++) {
-    uint32_t color = strip.ColorHSV(comets[c].hue, 255, 255);
-    for (int a = 0; a < 4; a++) {
-      const ConvArm& arm = convArms[a];
-      float head = CONV_SYNC_ARRIVAL ? comets[c].pos * arm.len / convRefLen   // this arm's coordinate
-                                     : comets[c].pos;
-      if (head - 4.0f * CONV_TAIL_SIGMA > arm.len) continue;   // already gone into the center
-      int x0 = max(0, (int)floorf(head - 4.0f * CONV_TAIL_SIGMA));
-      int x1 = min(arm.len, (int)ceilf(head) + 1);           // never past the center
-      for (int x = x0; x <= x1; x++) {
-        float k = head - x;                                  // >0 = behind the head
-        float b = (k >= 0.0f) ? expf(-k * k * inv2s2)       // tail
-                              : fmaxf(0.0f, 1.0f + k);       // sub-pixel lead-in, keeps motion smooth
-        if (b <= 0.0f) continue;
-        float duty = powf(CONV_LEVEL * b, LED_GAMMA);
-        int idx = arm.start + arm.dir * x;
-        if (duty > pixDuty[idx]) { pixDuty[idx] = duty; pixColor[idx] = color; }
-      }
+  for (int i = 0; i < NUM_LEDS; i++) {
+    float dc = distToCenter[i];
+    float L = convArmLen[convArmOf(i)];
+    pixColor[i] = glowColor;
+    pixDuty[i] = (dc > L + 0.5f) ? glowDuty : 0.0f;
+    if (dc > L + 0.5f) continue;
+    for (int c = 0; c < cometCount; c++) {
+      // head's distance from the center on this arm (sync: every arm's comet
+      // arrives at the same moment, whatever the arm's length)
+      float hd = CONV_SYNC_ARRIVAL ? L - comets[c].pos * L / convRefLen : L - comets[c].pos;
+      float k = dc - hd;                                   // >0 = behind the head (farther out)
+      if (k > 4.0f * CONV_TAIL_SIGMA || k < -1.0f) continue;
+      float bri = (k >= 0.0f) ? expf(-k * k * inv2s2)      // tail
+                              : 1.0f + k;                  // sub-pixel lead-in, keeps motion smooth
+      float duty = powf(CONV_LEVEL * bri, LED_GAMMA);
+      if (duty > pixDuty[i]) { pixDuty[i] = duty; pixColor[i] = strip.ColorHSV(comets[c].hue, 255, 255); }
     }
   }
 }
@@ -1579,10 +1586,7 @@ void setup() {
   strip2.setBrightness(255);
   stripPowerOn();
 
-  for (int i = 0; i < NUM_LEDS; i++) {   // distance along its own strip to that strip's center
-    distToCenter[i] = (i < NUM_LEDS1) ? abs(i - X_CENTER_A) : abs(i - X_CENTER_B);
-  }
-  initConvergeArms();
+  recomputeLayout();
   initPerlin();
 
   imu.settings.gyroSampleRate  = 416;
@@ -1637,6 +1641,25 @@ void handleCapture() {
         Serial.print(" gate pin with pull-up: "); Serial.print(up);
         Serial.print("  with pull-down: "); Serial.println(dn);
       }
+    } else if (cmd == 'K') {          // "K2,30.5" -> strip 2's center at LED 30.5
+      Serial.setTimeout(100);
+      int st = Serial.parseInt();
+      float c = Serial.parseFloat();
+      if (st == 1) strip1Center = c;
+      if (st == 2) strip2Center = c;
+      recomputeLayout();
+      lastActivityMs = millis();
+      Serial.print("CENTERS "); Serial.print(strip1Center, 1); Serial.print(" "); Serial.println(strip2Center, 1);
+    } else if (cmd == 'O') {          // "O3" -> jump straight to mode 3 (0-based)
+      Serial.setTimeout(100);
+      int m = Serial.parseInt();
+      if (m >= 0 && m < MODE_COUNT) mode = m;
+      lastActivityMs = millis();
+      Serial.print("MODE "); Serial.println(MODE_NAMES[mode]);
+    } else if (cmd == 'W') {
+      convDemo = !convDemo;
+      lastActivityMs = millis();
+      Serial.print("CONV DEMO "); Serial.println(convDemo ? "on" : "off");
     } else if (cmd == 'C') {
       if (asleep) wakeUp();
       layoutTestUntil = millis() + 15000;

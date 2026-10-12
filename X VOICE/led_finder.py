@@ -4,7 +4,7 @@ sits where. Uses the sketch's "L<strip>,<index>" serial command.
 
 Usage:  python led_finder.py [PORT]      (default COM3)
 """
-import sys, time
+import sys, time, threading
 import serial
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "COM3"
@@ -24,6 +24,19 @@ def main():
     ser.dtr = True
     time.sleep(0.5)
     strip, idx = 1, 0
+
+    # Keep draining what the board prints, or its USB writes back up and its
+    # loop freezes while this window is open.
+    stop = threading.Event()
+
+    def drain():
+        while not stop.is_set():
+            try:
+                ser.read(ser.in_waiting or 1)
+            except Exception:
+                break
+
+    threading.Thread(target=drain, daemon=True).start()
 
     def show():
         ser.reset_input_buffer()
@@ -51,6 +64,8 @@ def main():
             continue
         show()
     ser.write(b"L0,0\n")
+    stop.set()
+    time.sleep(0.3)
     ser.close()
 
 
