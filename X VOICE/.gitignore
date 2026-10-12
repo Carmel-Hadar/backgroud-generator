@@ -1,0 +1,5 @@
+# recordings and logs made by the tools - large, machine-specific
+sessions/
+trigger_samples/
+serial_log*.csv
+__pycache__/
