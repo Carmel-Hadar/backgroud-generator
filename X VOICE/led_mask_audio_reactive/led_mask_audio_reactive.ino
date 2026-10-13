@@ -250,14 +250,36 @@ void onPDMdata() {
 float NOISE_FLOOR_DB = 30.0f;   // "silence" - below this, level = 0
 // Guided calibration 2026-09-27: quiet p99 25, talk p90 44, shout p50 51 /
 // p99 56. At 64 even a shout never got the spread past ~1/3 of the arms.
-float LOUD_DB        = 56.0f;   // "shouting" - at/above this, level = 1.0 (pre-cap)
+// Recalibrated 2026-10-13: quiet p50 19, talk p50 35 / p90 48, high p90 52,
+// shout p50 54 / p99 60. At 56 a high voice already hit full spread/speed.
+float LOUD_DB        = 60.0f;   // "shouting" - at/above this, level = 1.0 (pre-cap)
+
+// "Sound floor" profile, toggled by a quadruple tap: for loud music, where the
+// voice thresholds above sit permanently at the top. Both ends move up so the
+// music's dynamics map onto the full range instead of saturating.
+// Scale estimate (not yet measured with music): mic -26dBFS @ 94dB SPL, PDM
+// gain 30 = -5dB -> internal dB ~= SPL - 35, before the voice-band filter takes
+// out the bass. Full-scale clipping sits at ~87-90 here (~120dB SPL), so a
+// 100-110dB SPL dance floor should read ~60-75. Check with serial_plotter.py.
+// The voice pair = the NOISE_FLOOR_DB / LOUD_DB defaults above, keep in sync.
+#define VOICE_NOISE_FLOOR_DB   30.0f
+#define VOICE_LOUD_DB          60.0f
+#define FLOOR_NOISE_FLOOR_DB   50.0f
+#define FLOOR_LOUD_DB          75.0f
+bool soundFloor = false;
+
+void setSoundFloor(bool on) {
+  soundFloor = on;
+  NOISE_FLOOR_DB = on ? FLOOR_NOISE_FLOOR_DB : VOICE_NOISE_FLOOR_DB;
+  LOUD_DB        = on ? FLOOR_LOUD_DB        : VOICE_LOUD_DB;
+}
 
 // Voice level that keeps the mask awake. Higher than NOISE_FLOOR_DB on
 // purpose: quiet rooms still throw occasional 30-39dB spikes, and at the
 // noise floor those would reset the idle clock forever and never let it sleep.
 #define ACTIVITY_DB      35.0f
 
-#define CURVE_EXPONENT   0.05f  // >1 compresses low/medium volume down;
+#define CURVE_EXPONENT   0.8f   // >1 compresses low/medium volume down;
                                  // <1 = log-like: quiet speech already lights
                                  // up, loud volume compresses.
                                  // (LED_GAMMA already handles the eye's curve.)
@@ -877,6 +899,10 @@ void processClickFrames() {
 // next TAP_REFRACT_MS (which also swallows the tap's own rebound ~70-100ms
 // later). A pair = two taps TAP_PAIR_MIN..MAX_MS apart, one >= TAP_STRONG_G
 // (2x anything movement produced) and the other >= TAP_WEAK_G.
+// Taps are counted as a sequence (each one TAP_PAIR_MIN..MAX_MS after the
+// last); TAP_PAIR_MAX_MS of quiet after the last tap ends it. 2-3 taps =
+// next mode, 4+ = sound floor on/off. So a double tap now fires ~0.5s after
+// the second tap instead of right on it.
 #define TAP_FS            905.0f   // the IMU's real 833Hz-nominal FIFO rate, measured
 #define TAP_HP_HZ         30.0f
 #define TAP_STRONG_G      4.5f
@@ -892,9 +918,10 @@ uint32_t tapSamples   = 0;      // FIFO samples processed since resetTap()
 int      tapInPeak    = 0;      // samples left in the current tap's window
 float    tapPeak      = 0.0f;
 uint32_t tapPeakStart = 0;
-bool     tapHaveLast  = false;  // an unpaired tap is waiting for its partner
-uint32_t tapLastStart = 0;
-float    tapLastPeak  = 0.0f;
+int      tapSeqCount  = 0;      // taps in the current sequence
+uint32_t tapLastStart = 0;      // start of the sequence's latest tap
+bool     tapSeqStrong = false;  // any tap in the sequence >= TAP_STRONG_G
+volatile bool quadTapTriggered = false;   // consumed by loop()
 uint32_t tapLastTrig  = 0;
 bool     tapTrigEver  = false;
 
@@ -907,7 +934,7 @@ void resetTap() {
   tapHP.a1 = -2.0f * cw / a0;
   tapHP.a2 = (1.0f - al) / a0;
   for (int k = 0; k < 3; k++) tapHP.z1[k] = tapHP.z2[k] = 0.0f;
-  tapSamples = 0; tapInPeak = 0; tapHaveLast = false; tapTrigEver = false;
+  tapSamples = 0; tapInPeak = 0; tapSeqCount = 0; tapTrigEver = false;
 }
 
 inline uint32_t tapMs(uint32_t samples) { return (uint32_t)(samples * 1000.0f / TAP_FS); }
@@ -928,23 +955,29 @@ void tapSample(const int16_t* raw) {
   if (tapInPeak > 0) {
     if (m > tapPeak) tapPeak = m;
     if (--tapInPeak > 0) return;
-    // the tap is over: pair it with the previous one, or keep it waiting
-    if (tapHaveLast) {
-      uint32_t dms = tapMs(tapPeakStart - tapLastStart);
-      if (dms >= TAP_PAIR_MIN_MS && dms <= TAP_PAIR_MAX_MS && fmaxf(tapPeak, tapLastPeak) >= TAP_STRONG_G) {
-        tapHaveLast = false;                         // a pair consumes both taps
-        if (!tapTrigEver || tapMs(tapPeakStart - tapLastTrig) >= TAP_COOLDOWN_MS) {
-          tapLastTrig = tapPeakStart;
-          tapTrigEver = true;
-          clickTriggered = true;
-        }
-        return;
-      }
+    // the tap is over: extend the sequence, or start a new one with it
+    uint32_t dms = tapMs(tapPeakStart - tapLastStart);
+    if (tapSeqCount > 0 && dms >= TAP_PAIR_MIN_MS && dms <= TAP_PAIR_MAX_MS) {
+      tapSeqCount++;
+      tapSeqStrong = tapSeqStrong || tapPeak >= TAP_STRONG_G;
+    } else {
+      tapSeqCount = 1;
+      tapSeqStrong = tapPeak >= TAP_STRONG_G;
     }
-    tapHaveLast = true;
     tapLastStart = tapPeakStart;
-    tapLastPeak = tapPeak;
-  } else if (m >= TAP_WEAK_G) {
+    return;
+  } else if (tapSeqCount > 0 && tapMs(n - tapLastStart) > TAP_PAIR_MAX_MS) {
+    // no follow-up tap in time: the sequence is complete
+    if (tapSeqCount >= 2 && tapSeqStrong &&
+        (!tapTrigEver || tapMs(tapLastStart - tapLastTrig) >= TAP_COOLDOWN_MS)) {
+      tapLastTrig = tapLastStart;
+      tapTrigEver = true;
+      if (tapSeqCount >= 4) quadTapTriggered = true;
+      else                  clickTriggered = true;
+    }
+    tapSeqCount = 0;
+  }
+  if (tapInPeak == 0 && m >= TAP_WEAK_G) {
     tapInPeak = (int)(TAP_REFRACT_MS * TAP_FS / 1000.0f);
     tapPeak = m;
     tapPeakStart = n;
@@ -1057,6 +1090,7 @@ const char* MODE_NAMES[MODE_COUNT] = {"X mode", "party", "led race", "X convergi
 uint8_t mode = MODE_TALK;
 
 uint32_t triggerFlashAt = 0;          // 0 = no flash running
+uint32_t triggerFlashRGB = 0xFFFFFF;  // white = next mode; sound floor: green = on, red = off
 #define  TRIGGER_FLASH_MS    150
 #define  TRIGGER_FLASH_DUTY  0.15f    // whole strip, white - ~340mA, under the limiter
 
@@ -1448,9 +1482,10 @@ void renderEffect() {
   layoutTestUntil = 0;
   // Confirmation that the trigger was heard: a short white flash of the whole strip.
   if (triggerFlashAt && millis() - triggerFlashAt < TRIGGER_FLASH_MS) {
-    uint8_t v = (uint8_t)(255 * TRIGGER_FLASH_DUTY * powf(GLOBAL_LEVEL, LED_GAMMA));
-    strip.fill(strip.Color(v, v, v));
-    strip2.fill(strip2.Color(v, v, v));
+    float k = TRIGGER_FLASH_DUTY * powf(GLOBAL_LEVEL, LED_GAMMA);
+    uint8_t r = ((triggerFlashRGB >> 16) & 0xFF) * k, g = ((triggerFlashRGB >> 8) & 0xFF) * k, b = (triggerFlashRGB & 0xFF) * k;
+    strip.fill(strip.Color(r, g, b));
+    strip2.fill(strip2.Color(r, g, b));
     strip.show();
     strip2.show();
     return;
@@ -1579,8 +1614,131 @@ void checkWake() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// CHARGE METER (on a USB charger, strip 1 shows the battery level)
+// ---------------------------------------------------------------------------
+// USB power + no USB host = a charger (a computer sends a USB start-of-frame
+// every 1ms even with no app open; a charger sends nothing). On a computer
+// the mask runs normally, for testing.
+//
+// The charger (BQ25100) has no power path: whatever the board and strips draw
+// comes out of its 100mA. So the meter isn't on all the time: it shows for
+// CHARGE_SHOW_MS every CHARGE_PERIOD_MS, with both strips cut off in between,
+// and everything else (mic, effects) is asleep while charging.
+//
+// The two 400mAh cells are in parallel = one 800mAh battery to the board.
+// Level is estimated from the cell voltage; while charging the charger pushes
+// the voltage up, so CHARGE_V_OFFSET is taken off first - the % is rough
+// (optimistic). "Full" comes from the charger's own ~CHG pin, not the voltage.
+#define PIN_CHG_STATUS     23      // P0.17, BQ25100 ~CHG: LOW = charging
+#define PIN_HICHG          22      // P0.13: LOW = 100mA charge current (else 50mA)
+#define PIN_VBAT_EN        32      // P0.14: keep LOW. HIGH while charging puts >3.3V on P0.31
+#define VBAT_DIVIDER       (1510.0f / 510.0f)   // 1M over 510k
+#define CHARGE_SHOW_MS     5000
+#define CHARGE_PERIOD_MS   20000
+#define CHARGE_V_OFFSET    0.08f   // V the charger adds on top of the resting voltage
+#define CHARGE_LEVEL       0.35f   // perceived brightness of the meter
+
+bool     chargeMode    = false;
+uint32_t usbHostSeenMs = 0;
+uint32_t usbLastFrame  = 0;
+uint32_t chargerSinceMs = 0;      // 0 = no charger right now
+uint32_t chargeShowUntil = 0, chargeNextShow = 0;
+float    vbatSmoothed  = 0.0f;
+bool     chargeStripsOn = false;
+
+void initCharge() {
+  pinMode(PIN_VBAT_EN, OUTPUT);
+  digitalWrite(PIN_VBAT_EN, LOW);        // divider on, and safe while charging
+  pinMode(PIN_HICHG, OUTPUT);
+  digitalWrite(PIN_HICHG, LOW);          // 100mA: 800mAh of cells
+  pinMode(PIN_CHG_STATUS, INPUT_PULLUP);
+  analogReference(AR_INTERNAL2V4);       // 0.6V ref, gain 1/4: 2.4V full scale
+  analogReadResolution(12);
+}
+
+float readVbat() {
+  return analogRead(PIN_VBAT) * 2.4f / 4095.0f * VBAT_DIVIDER;
+}
+
+// Single-cell LiPo, resting voltage -> rough state of charge.
+float vbatPercent(float v) {
+  static const float V[] = {3.30f, 3.60f, 3.70f, 3.80f, 3.90f, 4.00f, 4.10f, 4.20f};
+  static const float P[] = {0.0f, 10.0f, 30.0f, 55.0f, 75.0f, 88.0f, 95.0f, 100.0f};
+  if (v <= V[0]) return 0.0f;
+  for (int k = 1; k < 8; k++) {
+    if (v < V[k]) return P[k - 1] + (P[k] - P[k - 1]) * (v - V[k - 1]) / (V[k] - V[k - 1]);
+  }
+  return 100.0f;
+}
+
+bool usbPowered()  { return (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0; }
+
+void renderChargeMeter(bool charging) {
+  float pct = charging ? vbatPercent(vbatSmoothed - CHARGE_V_OFFSET) : 100.0f;
+  float fill = pct / 100.0f * NUM_LEDS1;               // strip 1 only, from its LED 0 up
+  float breath = 0.55f + 0.45f * sinf(millis() * 0.004f);
+  for (int i = 0; i < NUM_LEDS; i++) {
+    pixDuty[i] = 0.0f;
+    if (i >= NUM_LEDS1) continue;
+    float frac = (float)i / (NUM_LEDS1 - 1);
+    pixColor[i] = strip.ColorHSV((uint16_t)(frac * 21845.0f), 255, 255);   // red -> green along the bar
+    float on = constrain(fill - i, 0.0f, 1.0f);       // partial top LED
+    float level = CHARGE_LEVEL * on;
+    if (charging && i == (int)fill) level = CHARGE_LEVEL * breath;          // the growing edge breathes
+    pixDuty[i] = powf(level, LED_GAMMA);
+  }
+  showPixels();
+}
+
+// Returns true while the mask is in charge mode (loop() should do nothing else).
+bool serviceCharge() {
+  uint32_t now = millis();
+  uint32_t frame = NRF_USBD->FRAMECNTR;
+  if (frame != usbLastFrame) { usbLastFrame = frame; usbHostSeenMs = now; }
+  bool host = (now - usbHostSeenMs) < 300;
+  bool charger = usbPowered() && !host;
+
+  if (!charger) {
+    chargerSinceMs = 0;
+    if (chargeMode) {                                  // unplugged, or plugged into a computer
+      chargeMode = false;
+      wakeUp();
+    }
+    return false;
+  }
+  if (!chargerSinceMs) chargerSinceMs = now;
+  if (!chargeMode) {
+    if (now - chargerSinceMs < 1500) return false;     // let a computer enumerate first
+    chargeMode = true;
+    enterSleep();                                      // mic/effects off, strips cut
+    chargeStripsOn = false;
+    vbatSmoothed = readVbat();
+    chargeShowUntil = now + CHARGE_SHOW_MS;            // show right away
+    chargeNextShow = now + CHARGE_PERIOD_MS;
+  }
+
+  vbatSmoothed += 0.05f * (readVbat() - vbatSmoothed);
+  bool charging = digitalRead(PIN_CHG_STATUS) == LOW;
+  if ((int32_t)(now - chargeNextShow) >= 0) {
+    chargeShowUntil = now + CHARGE_SHOW_MS;
+    chargeNextShow = now + CHARGE_PERIOD_MS;
+  }
+  bool show = (int32_t)(now - chargeShowUntil) < 0;
+  if (show) {
+    if (!chargeStripsOn) { stripPowerOn(); chargeStripsOn = true; }
+    renderChargeMeter(charging);
+    delay(30);
+  } else {
+    if (chargeStripsOn) { strip.clear(); strip.show(); strip2.clear(); strip2.show(); stripPowerOff(); chargeStripsOn = false; }
+    delay(100);
+  }
+  return true;
+}
+
 void setup() {
   Serial.begin(115200);
+  initCharge();
 
   strip.setBrightness(255);   // no global scaling - renderEffect() scales per pixel
   strip2.setBrightness(255);
@@ -1656,6 +1814,8 @@ void handleCapture() {
       if (m >= 0 && m < MODE_COUNT) mode = m;
       lastActivityMs = millis();
       Serial.print("MODE "); Serial.println(MODE_NAMES[mode]);
+    } else if (cmd == 'V') {          // sound floor on/off, same as a quadruple tap
+      quadTapTriggered = true;
     } else if (cmd == 'W') {
       convDemo = !convDemo;
       lastActivityMs = millis();
@@ -1686,6 +1846,11 @@ void handleCapture() {
         Serial.print("reg 0x"); Serial.print(r, HEX); Serial.print(" = 0x"); Serial.println(v, HEX);
       }
       Serial.print("fifo read errors: "); Serial.println(fifoErrors);
+      Serial.print("usb power: "); Serial.print(usbPowered());
+      Serial.print("  usb frame: "); Serial.print(NRF_USBD->FRAMECNTR);
+      Serial.print("  vbat: "); Serial.print(readVbat(), 3);
+      Serial.print("V  ~CHG: "); Serial.print(digitalRead(PIN_CHG_STATUS));
+      Serial.print("  charge mode: "); Serial.println(chargeMode);
     }
   }
   if (streaming && millis() - streamStartMs > STREAM_MAX_MS) streaming = false;
@@ -1702,6 +1867,7 @@ void handleCapture() {
 
 void loop() {
   updateStatusLed();
+  if (serviceCharge()) return;     // on a USB charger: battery meter only
   handleCapture();
 
   if (asleep) {
@@ -1724,6 +1890,7 @@ void loop() {
     raceLastMs = 0;                 // race/party resume from where they were, no jump
     partyLastMs = 0;
     convLastMs = 0;
+    triggerFlashRGB = 0xFFFFFF;
     triggerFlashAt = millis();
     lastActivityMs = millis();
     if (streaming) {
@@ -1731,6 +1898,18 @@ void loop() {
     } else {
       Serial.print("TRIGGER mode=");
       Serial.println(MODE_NAMES[mode]);
+    }
+  }
+
+  if (quadTapTriggered) {
+    quadTapTriggered = false;
+    setSoundFloor(!soundFloor);
+    triggerFlashRGB = soundFloor ? 0x00FF00 : 0xFF0000;
+    triggerFlashAt = millis();
+    lastActivityMs = millis();
+    if (!streaming) {
+      Serial.print("SOUND FLOOR ");
+      Serial.println(soundFloor ? "on" : "off");
     }
   }
 

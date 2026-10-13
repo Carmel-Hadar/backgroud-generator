@@ -42,7 +42,7 @@ def cal_stage():
 BAUD = 115200
 WINDOW = 600              # samples on screen (~15s)
 NOISE_FLOOR_DB = 30.0     # keep in sync with the sketch
-LOUD_DB = 56.0
+LOUD_DB = 60.0
 PITCH_LOW_HZ = 90.0
 PITCH_HIGH_HZ = 160.0
 
