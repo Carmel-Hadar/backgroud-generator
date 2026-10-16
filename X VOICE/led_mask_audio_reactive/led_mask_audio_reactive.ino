@@ -254,7 +254,7 @@ float NOISE_FLOOR_DB = 30.0f;   // "silence" - below this, level = 0
 // shout p50 54 / p99 60. At 56 a high voice already hit full spread/speed.
 float LOUD_DB        = 60.0f;   // "shouting" - at/above this, level = 1.0 (pre-cap)
 
-// "Sound floor" profile, toggled by a quadruple tap: for loud music, where the
+// "Sound floor" profile, toggled by 5 taps: for loud music, where the
 // voice thresholds above sit permanently at the top. Both ends move up so the
 // music's dynamics map onto the full range instead of saturating.
 // Scale estimate (not yet measured with music): mic -26dBFS @ 94dB SPL, PDM
@@ -307,19 +307,16 @@ void setSoundFloor(bool on) {
 // ---------------------------------------------------------------------------
 // When the mask isn't moving, there's no point listening and driving LEDs.
 // Awake: IDLE_SLEEP_MS with no rotation above WAKE_GYRO_DPS and no voice
-// above ACTIVITY_DB -> sleep (talking with a still head keeps it awake). Asleep: gyro off, accel at 26Hz low-power, mic
-// off, strip dark, loop polls at 25Hz; any |a|-1g spike above WAKE_ACCEL_G
-// wakes it. The wake check stays at 25Hz on purpose - picking the mask up
-// takes well under a second and a slower poll would miss it.
-// Two thresholds, because each state reads a different sensor.
+// above ACTIVITY_DB -> sleep (talking with a still head keeps it awake). Asleep: gyro off, mic off, strip dark,
+// loop polls at 25Hz; a DOUBLE TAP wakes it (the same detector as the mode
+// switch, see DOUBLE TAP TRIGGER). The accel stays at 833Hz with its FIFO on,
+// since a few-ms tap falls between 26Hz samples; at ~0.15mA that costs ~1%
+// of the battery a day. (It used to wake on any |a|-1g spike above 0.5g,
+// which bumps, picking it up or moving its bag all did.)
 #define WAKE_GYRO_DPS     50.0f
 #define IDLE_SLEEP_MS     300000UL  // five minutes without motion or voice -> sleep
 #define GYRO_CHECK_MS     10        // awake: motion check at 100Hz
-#define SLEEP_SAMPLE_MS   40        // asleep: 25Hz, matches accel ODR
-// On |a| (magnitude, not an axis) so it doesn't depend on how the mask is
-// lying. Absolute value so free fall (|a|-1g down to -1) wakes it too.
-// 0.5g: The Wizard found 0.2g got woken by bumps to the table.
-#define WAKE_ACCEL_G      0.50f
+#define SLEEP_SAMPLE_MS   40        // asleep: 25Hz (~36 FIFO samples per poll)
 
 // After an ODR / power-mode change the LSM6DS3 outputs garbage for a few
 // cycles (saturated 2000dps readings were measured). Without this window the
@@ -900,9 +897,9 @@ void processClickFrames() {
 // later). A pair = two taps TAP_PAIR_MIN..MAX_MS apart, one >= TAP_STRONG_G
 // (2x anything movement produced) and the other >= TAP_WEAK_G.
 // Taps are counted as a sequence (each one TAP_PAIR_MIN..MAX_MS after the
-// last); TAP_PAIR_MAX_MS of quiet after the last tap ends it. 2-3 taps =
-// next mode, 4+ = sound floor on/off. So a double tap now fires ~0.5s after
-// the second tap instead of right on it.
+// last); TAP_PAIR_MAX_MS of quiet after the last tap ends it. 2 taps = next
+// mode, 3 = off, 4 = dim on/off, 5+ = sound floor on/off. So a double tap
+// fires ~0.5s after the second tap instead of right on it.
 #define TAP_FS            905.0f   // the IMU's real 833Hz-nominal FIFO rate, measured
 #define TAP_HP_HZ         30.0f
 #define TAP_STRONG_G      4.5f
@@ -921,7 +918,8 @@ uint32_t tapPeakStart = 0;
 int      tapSeqCount  = 0;      // taps in the current sequence
 uint32_t tapLastStart = 0;      // start of the sequence's latest tap
 bool     tapSeqStrong = false;  // any tap in the sequence >= TAP_STRONG_G
-volatile bool quadTapTriggered = false;   // consumed by loop()
+volatile int  tapDebugCount = 0;   // loop() prints "TAPS n" for each completed sequence
+volatile int  tapCommand = 0;   // taps in the last completed sequence (2+), consumed by loop()
 uint32_t tapLastTrig  = 0;
 bool     tapTrigEver  = false;
 
@@ -972,8 +970,8 @@ void tapSample(const int16_t* raw) {
         (!tapTrigEver || tapMs(tapLastStart - tapLastTrig) >= TAP_COOLDOWN_MS)) {
       tapLastTrig = tapLastStart;
       tapTrigEver = true;
-      if (tapSeqCount >= 4) quadTapTriggered = true;
-      else                  clickTriggered = true;
+      tapCommand = tapSeqCount;
+      tapDebugCount = tapSeqCount;
     }
     tapSeqCount = 0;
   }
@@ -1091,6 +1089,25 @@ uint8_t mode = MODE_TALK;
 
 uint32_t triggerFlashAt = 0;          // 0 = no flash running
 uint32_t triggerFlashRGB = 0xFFFFFF;  // white = next mode; sound floor: green = on, red = off
+// Wake-up: the whole X breathes pink WAKE_ANIM_PULSES times, softly, then
+// the current mode takes over.
+uint32_t wakeAnimAt = 0;              // 0 = not running
+#define  WAKE_ANIM_MS        2400
+#define  WAKE_ANIM_PULSES    2
+#define  WAKE_ANIM_LEVEL     0.45f    // perceived brightness at the top of a breath
+#define  WAKE_ANIM_RGB       0xFF2A8C   // pink
+
+// Dim mode (4 taps, as on the Somcha band): every channel is scaled by
+// DIM_FACTOR at the very end, after the current limiter, so it really is
+// that fraction of the light and current. Not saved: a power cycle starts
+// bright again (sleep keeps it).
+#define  DIM_FACTOR          0.3f
+bool     dimMode = false;
+
+// Manual off (3 taps): the current picture fades out over OFF_FADE_MS, then
+// the mask goes to sleep. A double tap wakes it, like the idle sleep.
+#define  OFF_FADE_MS         800
+uint32_t offFadeAt = 0;               // 0 = not fading
 #define  TRIGGER_FLASH_MS    150
 #define  TRIGGER_FLASH_DUTY  0.15f    // whole strip, white - ~340mA, under the limiter
 
@@ -1111,6 +1128,8 @@ void showPixels() {
   }
   const float master = powf(GLOBAL_LEVEL, LED_GAMMA);
   float k = powerLimitFactor(load * master, 1) * master;
+  if (dimMode) k *= DIM_FACTOR;
+  if (offFadeAt) k *= fmaxf(0.0f, 1.0f - (millis() - offFadeAt) / (float)OFF_FADE_MS);
   for (int i = 0; i < NUM_LEDS; i++) {
     uint32_t c = pixColor[i];
     float w = pixDuty[i] * k;
@@ -1482,7 +1501,7 @@ void renderEffect() {
   layoutTestUntil = 0;
   // Confirmation that the trigger was heard: a short white flash of the whole strip.
   if (triggerFlashAt && millis() - triggerFlashAt < TRIGGER_FLASH_MS) {
-    float k = TRIGGER_FLASH_DUTY * powf(GLOBAL_LEVEL, LED_GAMMA);
+    float k = TRIGGER_FLASH_DUTY * powf(GLOBAL_LEVEL, LED_GAMMA) * (dimMode ? DIM_FACTOR : 1.0f);
     uint8_t r = ((triggerFlashRGB >> 16) & 0xFF) * k, g = ((triggerFlashRGB >> 8) & 0xFF) * k, b = (triggerFlashRGB & 0xFF) * k;
     strip.fill(strip.Color(r, g, b));
     strip2.fill(strip2.Color(r, g, b));
@@ -1491,6 +1510,15 @@ void renderEffect() {
     return;
   }
   triggerFlashAt = 0;
+  if (wakeAnimAt && millis() - wakeAnimAt < WAKE_ANIM_MS) {
+    float t = (millis() - wakeAnimAt) / (float)WAKE_ANIM_MS;
+    float level = WAKE_ANIM_LEVEL * (0.5f - 0.5f * cosf(2.0f * PI * WAKE_ANIM_PULSES * t));
+    float duty = powf(level, LED_GAMMA);
+    for (int i = 0; i < NUM_LEDS; i++) { pixDuty[i] = duty; pixColor[i] = WAKE_ANIM_RGB; }
+    showPixels();
+    return;
+  }
+  wakeAnimAt = 0;
 
   switch (mode) {
     case MODE_PARTY: renderParty(); break;
@@ -1551,8 +1579,9 @@ void stripPowerOn() {
 void enterSleep() {
   if (asleep) return;
   asleep = true;
-  fifoStop();
-  imuConfigure(ODR_26HZ, ODR_OFF, true);   // gyro off, accel 26Hz low-power
+  imuConfigure(ODR_833HZ, ODR_OFF, false);   // gyro off, accel keeps feeding the tap detector
+  fifoStart();
+  resetTap();
   PDM.end();
   smoothedLevel = 0.0f;
   smoothedSpread = 0.0f;
@@ -1577,6 +1606,7 @@ void wakeUp() {
   // ten minutes on the table would fall straight back asleep next iteration.
   lastActivityMs = millis();
   startMic();
+  wakeAnimAt = millis();
   blinkStatus(LEDG);
   Serial.println("wake");
 }
@@ -1599,17 +1629,20 @@ void checkIdle() {
   }
 }
 
-// Asleep: gyro is off, so wake on acceleration magnitude alone.
+void printTapDebug() {
+  if (!tapDebugCount) return;
+  if (!streaming) { Serial.print("TAPS "); Serial.println(tapDebugCount); }
+  tapDebugCount = 0;
+}
+
+// Asleep: a double tap (or more) wakes it - without changing the mode.
 void checkWake() {
-  if ((int32_t)(millis() - imuSettleUntil) < 0) return;
-  float ax = imu.readFloatAccelX();
-  float ay = imu.readFloatAccelY();
-  float az = imu.readFloatAccelZ();
-  float aMag = sqrtf(ax * ax + ay * ay + az * az) - 1.0f;   // ~0 at rest, in g
-  if (fabsf(aMag) > WAKE_ACCEL_G) {
-    Serial.print("wake trigger ");
-    Serial.print((int)(fabsf(aMag) * 1000.0f));
-    Serial.println("mg");
+  serviceAccel();
+  printTapDebug();
+  if (clickTriggered || tapCommand) {
+    clickTriggered = false;
+    tapCommand = 0;
+    Serial.println("wake trigger: taps");
     wakeUp();
   }
 }
@@ -1814,8 +1847,12 @@ void handleCapture() {
       if (m >= 0 && m < MODE_COUNT) mode = m;
       lastActivityMs = millis();
       Serial.print("MODE "); Serial.println(MODE_NAMES[mode]);
-    } else if (cmd == 'V') {          // sound floor on/off, same as a quadruple tap
-      quadTapTriggered = true;
+    } else if (cmd == 'Y') {          // replay the wake-up pulse (awake)
+      if (!asleep) wakeAnimAt = millis();
+    } else if (cmd == 'Z') {          // sleep now (testing the tap wake)
+      if (!asleep) enterSleep();
+    } else if (cmd == 'V') {          // sound floor on/off, same as 5 taps
+      tapCommand = 5;
     } else if (cmd == 'W') {
       convDemo = !convDemo;
       lastActivityMs = millis();
@@ -1883,7 +1920,19 @@ void loop() {
   processClickFrames();
 #endif
   serviceAccel();                   // FIFO -> double-tap detector (+ stream packets)
+  printTapDebug();
   if (findStrip) lastActivityMs = millis();   // don't fall asleep while mapping LEDs
+  if (offFadeAt) {                  // 3 taps: fading out, taps ignored meanwhile
+    tapCommand = 0;
+    clickTriggered = false;
+    if (millis() - offFadeAt >= OFF_FADE_MS) {
+      offFadeAt = 0;
+      Serial.println("off (3 taps)");
+      enterSleep();
+      return;
+    }
+  }
+  if (tapCommand == 2) { tapCommand = 0; clickTriggered = true; }
   if (clickTriggered) {
     clickTriggered = false;
     mode = (mode + 1) % MODE_COUNT;
@@ -1901,8 +1950,25 @@ void loop() {
     }
   }
 
-  if (quadTapTriggered) {
-    quadTapTriggered = false;
+  if (tapCommand == 3) {
+    tapCommand = 0;
+    offFadeAt = millis();
+    wakeAnimAt = 0;
+    triggerFlashAt = 0;
+  }
+
+  if (tapCommand == 4) {
+    tapCommand = 0;
+    dimMode = !dimMode;
+    lastActivityMs = millis();
+    if (!streaming) {
+      Serial.print("DIM ");
+      Serial.println(dimMode ? "on" : "off");
+    }
+  }
+
+  if (tapCommand >= 5) {
+    tapCommand = 0;
     setSoundFloor(!soundFloor);
     triggerFlashRGB = soundFloor ? 0x00FF00 : 0xFF0000;
     triggerFlashAt = millis();
